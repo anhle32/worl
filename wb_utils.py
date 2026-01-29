@@ -1,4 +1,3 @@
-import pandas_datareader.wb as wb
 import pandas as pd
 import streamlit as st
 import numpy as np
@@ -8,6 +7,17 @@ from sklearn.linear_model import LinearRegression
 import os
 import requests
 import json
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+
+# Suppress warnings
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+# --- Configuration ---
+REQUEST_TIMEOUT = 15  # seconds
+MAX_RETRIES = 2
+RETRY_DELAY = 1  # seconds
 
 # --- Visitor Counter ---
 VISITOR_FILE = "visits.txt"
@@ -34,12 +44,7 @@ def get_and_update_visitor_count():
         pass
     return count
 
-
-
 # --- Data Caching & Fetching ---
-import warnings
-# Suppress FutureWarning from pandas_datareader about errors='ignore'
-warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 INDICATORS = {
@@ -95,31 +100,153 @@ INDICATORS = {
     "Khu vực bảo tồn trên cạn và biển (% tổng diện tích lãnh thổ)": "ER.PTD.TOTL.ZS",
     "Tổng nghĩa vụ nợ (% xuất khẩu hàng hóa, dịch vụ và thu nhập sơ cấp)": "DT.TDS.DECT.EX.ZS"
 }
-@st.cache_data
-def get_country_list():
-    """Fetches a list of countries from World Bank API."""
-    try:
-        countries = wb.get_countries()
-        # Filter for aggregates and actual countries if needed, but for now we take all valid ones
-        # typically we want only actual countries, not regions, but the prompt mentioned Region/IncomeGroup
-        return countries
-    except Exception as e:
-        st.error(f"Error fetching country list: {e}")
-        return pd.DataFrame()
 
-@st.cache_data
-def fetch_worldbank_data(indicators, countries, start, end):
-    """Downloads data from World Bank API."""
+# --- Sample/Fallback Countries Data ---
+SAMPLE_COUNTRIES = pd.DataFrame({
+    'iso3c': ['VNM', 'CHN', 'USA', 'JPN', 'KOR', 'IND', 'THA', 'IDN', 'MYS', 'PHL', 'SGP', 'DEU', 'FRA', 'GBR', 'ITA', 'CAN', 'AUS', 'BRA', 'RUS', 'MEX'],
+    'iso2c': ['VN', 'CN', 'US', 'JP', 'KR', 'IN', 'TH', 'ID', 'MY', 'PH', 'SG', 'DE', 'FR', 'GB', 'IT', 'CA', 'AU', 'BR', 'RU', 'MX'],
+    'name': ['Vietnam', 'China', 'United States', 'Japan', 'Korea, Rep.', 'India', 'Thailand', 'Indonesia', 'Malaysia', 'Philippines', 'Singapore', 'Germany', 'France', 'United Kingdom', 'Italy', 'Canada', 'Australia', 'Brazil', 'Russian Federation', 'Mexico'],
+    'region': ['East Asia & Pacific', 'East Asia & Pacific', 'North America', 'East Asia & Pacific', 'East Asia & Pacific', 'South Asia', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'Europe & Central Asia', 'Europe & Central Asia', 'Europe & Central Asia', 'Europe & Central Asia', 'North America', 'East Asia & Pacific', 'Latin America & Caribbean', 'Europe & Central Asia', 'Latin America & Caribbean'],
+    'capitalCity': ['Hanoi', 'Beijing', 'Washington D.C.', 'Tokyo', 'Seoul', 'New Delhi', 'Bangkok', 'Jakarta', 'Kuala Lumpur', 'Manila', 'Singapore', 'Berlin', 'Paris', 'London', 'Rome', 'Ottawa', 'Canberra', 'Brasilia', 'Moscow', 'Mexico City']
+})
+
+
+def _make_request_with_retry(url, max_retries=MAX_RETRIES):
+    """Make HTTP request with retry and timeout."""
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:  # Rate limited
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+        except requests.exceptions.Timeout:
+            if attempt < max_retries:
+                time.sleep(RETRY_DELAY)
+                continue
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries:
+                time.sleep(RETRY_DELAY)
+                continue
+            break
+    return None
+
+
+@st.cache_data(ttl=3600)  # Cache for 1 hour
+def get_country_list():
+    """Fetches a list of countries from World Bank API with fallback."""
     try:
-        df = wb.download(indicator=indicators, country=countries, start=start, end=end)
-        df = df.reset_index()
-        # Ensure Year is numeric and sorted
-        df['year'] = pd.to_numeric(df['year'])
-        df = df.sort_values(by=['country', 'year'])
-        return df
+        # Try World Bank API directly
+        url = "https://api.worldbank.org/v2/country?format=json&per_page=300"
+        data = _make_request_with_retry(url)
+        
+        if data and len(data) > 1:
+            countries_data = data[1]
+            df = pd.DataFrame(countries_data)
+            
+            # Filter only countries (not aggregates/regions)
+            if 'capitalCity' in df.columns:
+                df = df[df['capitalCity'].notna() & (df['capitalCity'] != '')]
+            
+            # Rename columns to match expected format
+            df = df.rename(columns={
+                'id': 'iso3c',
+                'iso2Code': 'iso2c'
+            })
+            
+            # Extract region name
+            if 'region' in df.columns:
+                df['region'] = df['region'].apply(lambda x: x.get('value', '') if isinstance(x, dict) else str(x))
+            
+            return df[['iso3c', 'iso2c', 'name', 'region', 'capitalCity']].reset_index(drop=True)
+        
     except Exception as e:
-        # st.error(f"Error downloading data: {e}") # Let the app handle the alert
+        pass  # Will fallback to sample data
+    
+    # Fallback to sample countries
+    st.warning("⚠️ Không thể kết nối World Bank API. Đang sử dụng danh sách quốc gia mẫu.")
+    return SAMPLE_COUNTRIES.copy()
+
+
+def _fetch_indicator_data(indicator, countries, start, end):
+    """Fetch data for a single indicator."""
+    countries_str = ";".join(countries)
+    url = f"https://api.worldbank.org/v2/country/{countries_str}/indicator/{indicator}?format=json&date={start}:{end}&per_page=10000"
+    
+    data = _make_request_with_retry(url)
+    
+    if data and len(data) > 1 and data[1]:
+        records = []
+        for item in data[1]:
+            records.append({
+                'country': item.get('country', {}).get('value', ''),
+                'countryiso3code': item.get('countryiso3code', ''),
+                'year': int(item.get('date', 0)),
+                indicator: item.get('value')
+            })
+        return pd.DataFrame(records)
+    return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
+def fetch_worldbank_data(indicators, countries, start, end):
+    """Downloads data from World Bank API with parallel requests and fallback."""
+    if not indicators or not countries:
         return None
+    
+    all_data = []
+    progress_text = st.empty()
+    progress_bar = st.progress(0)
+    
+    try:
+        # Use ThreadPoolExecutor for parallel requests
+        with ThreadPoolExecutor(max_workers=min(5, len(indicators))) as executor:
+            futures = {
+                executor.submit(_fetch_indicator_data, ind, countries, start, end): ind 
+                for ind in indicators
+            }
+            
+            completed = 0
+            for future in as_completed(futures):
+                indicator = futures[future]
+                completed += 1
+                progress_bar.progress(completed / len(indicators))
+                progress_text.text(f"Đang tải: {completed}/{len(indicators)} chỉ số...")
+                
+                try:
+                    result = future.result()
+                    if result is not None and not result.empty:
+                        all_data.append(result)
+                except Exception:
+                    pass
+        
+        progress_bar.empty()
+        progress_text.empty()
+        
+        if all_data:
+            # Merge all indicator dataframes
+            merged_df = all_data[0]
+            for df in all_data[1:]:
+                # Get the indicator column (last column that's not country/year)
+                ind_cols = [c for c in df.columns if c not in ['country', 'countryiso3code', 'year']]
+                if ind_cols:
+                    merged_df = pd.merge(
+                        merged_df, 
+                        df[['country', 'year'] + ind_cols],
+                        on=['country', 'year'],
+                        how='outer'
+                    )
+            
+            merged_df = merged_df.sort_values(by=['country', 'year']).reset_index(drop=True)
+            return merged_df
+        
+    except Exception as e:
+        progress_bar.empty()
+        progress_text.empty()
+        st.error(f"Lỗi khi tải dữ liệu: {str(e)}")
+    
+    return None
 
 # --- Data Processing ---
 def handle_missing_data(df, method, indicators):
