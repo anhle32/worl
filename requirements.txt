@@ -1,6 +1,6 @@
-streamlit
+streamlit>=1.37.0
 pandas
-requests
+pandas_datareader
 plotly
 statsmodels
 scikit-learn
