@@ -7,11 +7,79 @@ import numpy as np
 import wb_utils as utils
 from PIL import Image
 import textwrap
+import geopandas as gpd
+import matplotlib.pyplot as plt
+
 # --- Configuration ---
 
 st.set_page_config(page_title="WorldBank Data Analytics Pro", layout="wide")
 
 # --- Helper Fragments ---
+@st.fragment(run_every=60)  # Reduced from 20s to 60s for stability with 200 concurrent users
+def render_eth_monitor():
+    # Fetch Data
+    eth_data = utils.get_latest_eth_blocks(8)
+    eth_price_data = utils.get_eth_price()
+    
+    # Current Time
+    import datetime
+    now_str = datetime.datetime.now().strftime("%H:%M")
+    
+    # Build HTML
+    html_content = ""
+    
+    # 1. Price Section
+    if eth_price_data:
+        price_val = eth_price_data['price']
+        vol_val = eth_price_data['volume']
+        
+        # Format
+        price_str = f"${price_val:,.2f}"
+        vol_str = f"Vol {vol_val:,.0f} USDT"
+        
+        # Use single line or explicitly flush strings to avoid markdown code blocks
+        html_content += f"""
+<div style="display: flex; flex-direction: column; align-items: flex-start; margin-bottom: 8px;">
+<div style="font-size: 14px; font-weight: bold; color: #000;">Price History</div>
+<div style="display: flex; flex-direction: row; align-items: baseline; gap: 8px;">
+<div style="font-size: 28px; font-weight: bold; color: #000;">{price_str}</div>
+<div style="font-size: 16px; color: #888;">• {now_str}</div>
+</div>
+<div style="font-size: 14px; color: #000;">{vol_str}</div>
+</div>
+"""
+    
+    # 2. Blockchain Section
+    if eth_data:
+        # Inline Styles to ensure horizontal layout (xoay ngang)
+        container_style = "display: flex; flex-direction: row; gap: 5px; align-items: flex-end; justify-content: flex-start; margin-top: 5px; overflow: hidden;"
+        block_style = "width: 40px; height: 40px; background-color: #f3e5f5; border-radius: 4px; position: relative; display: flex; align-items: flex-end; justify-content: center; font-size: 8px; color: #4a148c; font-weight: bold; box-shadow: 0 1px 3px rgba(0,0,0,0.1);"
+        
+        blocks_html = ""
+        for b in eth_data:
+            height_pct = min(max(b['fullness'], 0), 100)
+            # Fill style
+            fill_style = f"width: 100%; height: {height_pct}%; background: linear-gradient(180deg, #d1c4e9 0%, #ce93d8 100%); border-radius: 0 0 4px 4px; position: absolute; bottom: 0; left: 0; z-index: 1;"
+            num_style = "z-index: 2; margin-bottom: 2px; color: #4a148c;"
+            
+            # Zero indentation
+            blocks_html += f"""
+<div style="{block_style}" title="Block #{b['number']} - Gas: {b['fullness']:.1f}%">
+<div style="{fill_style}"></div>
+<div style="{num_style}">#{str(b['number'])[-3:]}</div>
+</div>"""
+        
+        html_content += f"""
+<div style="font-size: 12px; color: #000; font-weight: bold; margin-bottom: 2px;">Blockchain ETH</div>
+<div style="{container_style}">
+{blocks_html}
+</div>
+"""
+        
+        st.markdown(html_content, unsafe_allow_html=True)
+        
+    else:
+            st.markdown("<div style='margin-top:20px; color:#999; font-size:12px;'>Loading ETH data...</div>", unsafe_allow_html=True)
 
 
 # --- Header ---
@@ -28,8 +96,9 @@ with col_header2:
     """, unsafe_allow_html=True)
 
 with col_header3:
-    # Ethereum Blocks Visualization - REMOVED
-    pass
+    # Ethereum Blocks Visualization
+    # Using top-level fragment with auto-refresh (20s)
+    render_eth_monitor()
 
 
 
@@ -39,31 +108,31 @@ st.sidebar.title("Cấu hình")
 
 # 1. Country Selection
 st.sidebar.subheader("1. Chọn dữ liệu")
-
-# Load countries from cache with spinner
-with st.sidebar:
-    with st.spinner("Đang tải danh sách quốc gia..."):
-        all_countries_df = utils.get_country_list()
-
+# Load countries from cache
+all_countries_df = utils.get_country_list()
 if not all_countries_df.empty:
-    # Create country map {iso3c: name}
+    # Filter out aggregates if possible, usually 'region' column is 'Aggregates' or similar
+    # But for simplicity and to match prompt "Region", we'll just show name and code
+    country_options = all_countries_df[['name', 'iso2c']].set_index('iso2c')['name'].to_dict()
+    # Also support iso3c if available, wb typically returns iso2c in keys. 
+    # Let's map iso2c to name for display, value is iso2c (WB API often takes iso2 or iso3)
+    # The prompt mentions ABW, VNM (iso3). wb.download works with both.
+    # Let's use the 'id' column which usually stores the code passed to API.
+    
+    # We'll creates a dict {Code: Name}
+    # It seems wb.get_countries() returns 'iso3c', 'iso2c', 'name', etc.
     if 'iso3c' in all_countries_df.columns:
-        country_map = dict(zip(all_countries_df['iso3c'], all_countries_df['name']))
-    elif 'id' in all_countries_df.columns:
-        country_map = dict(zip(all_countries_df['id'], all_countries_df['name']))
+         country_map = dict(zip(all_countries_df['iso3c'], all_countries_df['name']))
     else:
-        country_map = {}
+         country_map = dict(zip(all_countries_df['id'], all_countries_df['name']))
 else:
     country_map = {}
-
-# Set default countries (only if they exist in the map)
-default_countries = [c for c in ['VNM', 'CHN', 'USA'] if c in country_map]
 
 selected_country_codes = st.sidebar.multiselect(
     "Chọn Quốc gia",
     options=list(country_map.keys()),
     format_func=lambda x: f"{x} - {country_map.get(x, '')}",
-    default=default_countries
+    default=['VNM', 'CHN', 'USA']  # Defaults
 )
 
 # 2. Indicator Selection
@@ -483,9 +552,6 @@ with tab5:
     st.header("Tăng trưởng kinh tế theo khu vực")
     st.markdown("Số liệu về tăng trưởng kinh tế được tính theo giá cố định, các số liệu thu thập và dự báo được lấy từ World Economic Outlook (WEO) của IMF")
     
-    import geopandas as gpd
-    import matplotlib.pyplot as plt
-
     # 1. Define Regions
     REGION_COUNTRIES = {
         "Đông Nam Á": ["Vietnam", "Thailand", "Indonesia", "Malaysia", "Philippines", "Singapore", "Cambodia", "Laos", "Myanmar", "Brunei"],
@@ -524,20 +590,14 @@ with tab5:
                 # Prepare data for plotting: Country, Value
                 plot_data = region_df[['COUNTRY', selected_year]].rename(columns={selected_year: 'GrowthRate'})
                 
-                # 5. Load Map with better caching
-                @st.cache_data(ttl=86400)  # Cache for 24 hours
+                # 5. Load Map
+                @st.cache_data
                 def load_map_data():
-                    try:
-                        url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-                        return gpd.read_file(url)
-                    except Exception:
-                        # Try alternative URL
-                        alt_url = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson"
-                        return gpd.read_file(alt_url)
+                    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+                    return gpd.read_file(url)
 
                 try:
-                    with st.spinner("Đang tải bản đồ..."):
-                        world = load_map_data()
+                    world = load_map_data()
                 except Exception as e:
                      st.error(f"Không thể tải dữ liệu bản đồ từ internet: {e}")
                      st.stop()
