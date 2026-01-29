@@ -1,3 +1,4 @@
+import pandas_datareader.wb as wb
 import pandas as pd
 import streamlit as st
 import numpy as np
@@ -7,44 +8,71 @@ from sklearn.linear_model import LinearRegression
 import os
 import requests
 import json
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import warnings
+import threading
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# Suppress warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+# --- Connection Pooling for HTTP Requests ---
+_http_session = None
+_session_lock = threading.Lock()
 
-# --- Configuration ---
-REQUEST_TIMEOUT = 15  # seconds
-MAX_RETRIES = 2
-RETRY_DELAY = 1  # seconds
+def get_http_session():
+    """Returns a shared requests.Session with connection pooling and retry logic."""
+    global _http_session
+    if _http_session is None:
+        with _session_lock:
+            if _http_session is None:
+                session = requests.Session()
+                retries = Retry(
+                    total=2,
+                    backoff_factor=0.3,
+                    status_forcelist=[429, 500, 502, 503, 504]
+                )
+                adapter = HTTPAdapter(
+                    max_retries=retries,
+                    pool_connections=20,
+                    pool_maxsize=50
+                )
+                session.mount('https://', adapter)
+                session.mount('http://', adapter)
+                _http_session = session
+    return _http_session
 
-# --- Visitor Counter ---
+
+# --- Visitor Counter (Thread-Safe) ---
 VISITOR_FILE = "visits.txt"
+_visitor_lock = threading.Lock()
 
 def get_visitor_count():
-    """Reads the current visitor count."""
-    if os.path.exists(VISITOR_FILE):
-        try:
-            with open(VISITOR_FILE, "r") as f:
-                content = f.read().strip()
-                if content.isdigit():
-                    return int(content)
-        except:
-            pass
+    """Reads the current visitor count (thread-safe)."""
+    with _visitor_lock:
+        if os.path.exists(VISITOR_FILE):
+            try:
+                with open(VISITOR_FILE, "r") as f:
+                    content = f.read().strip()
+                    if content.isdigit():
+                        return int(content)
+            except:
+                pass
     return 0
 
 def get_and_update_visitor_count():
-    """Increments and returns the visitor count."""
-    count = get_visitor_count() + 1
-    try:
-        with open(VISITOR_FILE, "w") as f:
-            f.write(str(count))
-    except:
-        pass
-    return count
+    """Increments and returns the visitor count (thread-safe)."""
+    with _visitor_lock:
+        count = get_visitor_count() + 1
+        try:
+            with open(VISITOR_FILE, "w") as f:
+                f.write(str(count))
+        except:
+            pass
+        return count
+
+
 
 # --- Data Caching & Fetching ---
+import warnings
+# Suppress FutureWarning from pandas_datareader about errors='ignore'
+warnings.simplefilter(action='ignore', category=FutureWarning)
 
 
 INDICATORS = {
@@ -100,151 +128,61 @@ INDICATORS = {
     "Khu vực bảo tồn trên cạn và biển (% tổng diện tích lãnh thổ)": "ER.PTD.TOTL.ZS",
     "Tổng nghĩa vụ nợ (% xuất khẩu hàng hóa, dịch vụ và thu nhập sơ cấp)": "DT.TDS.DECT.EX.ZS"
 }
-
-# --- Sample/Fallback Countries Data ---
-SAMPLE_COUNTRIES = pd.DataFrame({
-    'iso3c': ['VNM', 'CHN', 'USA', 'JPN', 'KOR', 'IND', 'THA', 'IDN', 'MYS', 'PHL', 'SGP', 'DEU', 'FRA', 'GBR', 'ITA', 'CAN', 'AUS', 'BRA', 'RUS', 'MEX'],
-    'iso2c': ['VN', 'CN', 'US', 'JP', 'KR', 'IN', 'TH', 'ID', 'MY', 'PH', 'SG', 'DE', 'FR', 'GB', 'IT', 'CA', 'AU', 'BR', 'RU', 'MX'],
-    'name': ['Vietnam', 'China', 'United States', 'Japan', 'Korea, Rep.', 'India', 'Thailand', 'Indonesia', 'Malaysia', 'Philippines', 'Singapore', 'Germany', 'France', 'United Kingdom', 'Italy', 'Canada', 'Australia', 'Brazil', 'Russian Federation', 'Mexico'],
-    'region': ['East Asia & Pacific', 'East Asia & Pacific', 'North America', 'East Asia & Pacific', 'East Asia & Pacific', 'South Asia', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'East Asia & Pacific', 'Europe & Central Asia', 'Europe & Central Asia', 'Europe & Central Asia', 'Europe & Central Asia', 'North America', 'East Asia & Pacific', 'Latin America & Caribbean', 'Europe & Central Asia', 'Latin America & Caribbean'],
-    'capitalCity': ['Hanoi', 'Beijing', 'Washington D.C.', 'Tokyo', 'Seoul', 'New Delhi', 'Bangkok', 'Jakarta', 'Kuala Lumpur', 'Manila', 'Singapore', 'Berlin', 'Paris', 'London', 'Rome', 'Ottawa', 'Canberra', 'Brasilia', 'Moscow', 'Mexico City']
-})
-
-
-def _make_request_with_retry(url, max_retries=MAX_RETRIES):
-    """Make HTTP request with retry and timeout."""
-    for attempt in range(max_retries + 1):
-        try:
-            response = requests.get(url, timeout=REQUEST_TIMEOUT)
-            if response.status_code == 200:
-                return response.json()
-            elif response.status_code == 429:  # Rate limited
-                time.sleep(RETRY_DELAY * (attempt + 1))
-                continue
-        except requests.exceptions.Timeout:
-            if attempt < max_retries:
-                time.sleep(RETRY_DELAY)
-                continue
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries:
-                time.sleep(RETRY_DELAY)
-                continue
-            break
-    return None
-
-
-@st.cache_data(ttl=3600)  # Cache for 1 hour
+@st.cache_data
 def get_country_list():
-    """Fetches a list of countries from World Bank API with fallback."""
+    """Fetches a list of countries from World Bank API."""
     try:
-        # Try World Bank API directly
-        url = "https://api.worldbank.org/v2/country?format=json&per_page=300"
-        data = _make_request_with_retry(url)
-        
-        if data and len(data) > 1:
-            countries_data = data[1]
-            df = pd.DataFrame(countries_data)
-            
-            # Filter only countries (not aggregates/regions)
-            if 'capitalCity' in df.columns:
-                df = df[df['capitalCity'].notna() & (df['capitalCity'] != '')]
-            
-            # Rename columns to match expected format
-            df = df.rename(columns={
-                'id': 'iso3c',
-                'iso2Code': 'iso2c'
-            })
-            
-            # Extract region name
-            if 'region' in df.columns:
-                df['region'] = df['region'].apply(lambda x: x.get('value', '') if isinstance(x, dict) else str(x))
-            
-            return df[['iso3c', 'iso2c', 'name', 'region', 'capitalCity']].reset_index(drop=True)
-        
+        countries = wb.get_countries()
+        # Filter for aggregates and actual countries if needed, but for now we take all valid ones
+        # typically we want only actual countries, not regions, but the prompt mentioned Region/IncomeGroup
+        return countries
     except Exception as e:
-        pass  # Will fallback to sample data
-    
-    # Fallback to sample countries
-    st.warning("⚠️ Không thể kết nối World Bank API. Đang sử dụng danh sách quốc gia mẫu.")
-    return SAMPLE_COUNTRIES.copy()
+        st.error(f"Error fetching country list: {e}")
+        return pd.DataFrame()
 
-
-def _fetch_indicator_data(indicator, countries, start, end):
-    """Fetch data for a single indicator."""
-    countries_str = ";".join(countries)
-    url = f"https://api.worldbank.org/v2/country/{countries_str}/indicator/{indicator}?format=json&date={start}:{end}&per_page=10000"
-    
-    data = _make_request_with_retry(url)
-    
-    if data and len(data) > 1 and data[1]:
-        records = []
-        for item in data[1]:
-            records.append({
-                'country': item.get('country', {}).get('value', ''),
-                'countryiso3code': item.get('countryiso3code', ''),
-                'year': int(item.get('date', 0)),
-                indicator: item.get('value')
-            })
-        return pd.DataFrame(records)
-    return None
-
-
-@st.cache_data(ttl=3600, show_spinner=False)  # Cache for 1 hour
+@st.cache_data(ttl=300)  # Cache for 5 minutes
 def fetch_worldbank_data(indicators, countries, start, end):
-    """Downloads data from World Bank API with parallel requests and fallback."""
-    if not indicators or not countries:
-        return None
+    """
+    Downloads data from World Bank API with improved error handling.
+    - First tries batch download for all countries
+    - If batch fails, tries each country individually
+    - Skips countries without data instead of failing entirely
+    """
+    all_dfs = []
     
-    all_data = []
-    progress_text = st.empty()
-    progress_bar = st.progress(0)
-    
+    # Try batch download first (faster)
     try:
-        # Use ThreadPoolExecutor for parallel requests
-        with ThreadPoolExecutor(max_workers=min(5, len(indicators))) as executor:
-            futures = {
-                executor.submit(_fetch_indicator_data, ind, countries, start, end): ind 
-                for ind in indicators
-            }
-            
-            completed = 0
-            for future in as_completed(futures):
-                indicator = futures[future]
-                completed += 1
-                progress_bar.progress(completed / len(indicators))
-                progress_text.text(f"Đang tải: {completed}/{len(indicators)} chỉ số...")
-                
-                try:
-                    result = future.result()
-                    if result is not None and not result.empty:
-                        all_data.append(result)
-                except Exception:
-                    pass
-        
-        progress_bar.empty()
-        progress_text.empty()
-        
-        if all_data:
-            # Merge all indicator dataframes
-            merged_df = all_data[0]
-            for df in all_data[1:]:
-                # Get the indicator column (last column that's not country/year)
-                ind_cols = [c for c in df.columns if c not in ['country', 'countryiso3code', 'year']]
-                if ind_cols:
-                    merged_df = pd.merge(
-                        merged_df, 
-                        df[['country', 'year'] + ind_cols],
-                        on=['country', 'year'],
-                        how='outer'
-                    )
-            
-            merged_df = merged_df.sort_values(by=['country', 'year']).reset_index(drop=True)
-            return merged_df
-        
-    except Exception as e:
-        progress_bar.empty()
-        progress_text.empty()
-        st.error(f"Lỗi khi tải dữ liệu: {str(e)}")
+        df = wb.download(indicator=indicators, country=countries, start=start, end=end)
+        if df is not None and not df.empty:
+            df = df.reset_index()
+            df['year'] = pd.to_numeric(df['year'])
+            df = df.sort_values(by=['country', 'year'])
+            return df
+    except Exception as batch_error:
+        # Batch failed, try individual countries
+        pass
+    
+    # Fallback: Try each country individually
+    for country_code in countries:
+        try:
+            single_df = wb.download(
+                indicator=indicators, 
+                country=[country_code], 
+                start=start, 
+                end=end
+            )
+            if single_df is not None and not single_df.empty:
+                single_df = single_df.reset_index()
+                all_dfs.append(single_df)
+        except Exception as e:
+            # Skip this country silently - no data available
+            continue
+    
+    if all_dfs:
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df['year'] = pd.to_numeric(combined_df['year'])
+        combined_df = combined_df.sort_values(by=['country', 'year'])
+        return combined_df
     
     return None
 
@@ -362,4 +300,154 @@ def forecast_series(series, model_type, years=2):
         return None, None, str(e)
 
 # --- Ethereum Data ---
+# Global cache for last successful ETH data (fallback when API fails)
+_last_eth_blocks = None
+_last_eth_price = None
+
+@st.cache_data(ttl=60, show_spinner=False)  # Extended from 10s to 60s
+def get_latest_eth_blocks(limit=6):
+    """
+    Fetches the latest 'limit' blocks from Ethereum mainnet.
+    Uses connection pooling and returns cached fallback on complete failure.
+    """
+    global _last_eth_blocks
+    
+    rpc_urls = [
+        "https://eth.public-rpc.com", 
+        "https://1rpc.io/eth",
+        "https://rpc.flashbots.net",
+        "https://cloudflare-eth.com"
+    ]
+    
+    session = get_http_session()
+    headers = {'Content-Type': 'application/json'}
+    
+    for url in rpc_urls:
+        try:
+            # 1. Get Latest Block Number
+            payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+            response = session.post(url, json=payload, headers=headers, timeout=2)
+            
+            if response.status_code != 200:
+                continue
+                
+            res_json = response.json()
+            if 'result' not in res_json:
+                continue
+                
+            latest_block = int(res_json['result'], 16)
+            
+            # 2. Batch Fetch Previous Blocks
+            batch_payload = []
+            for i in range(limit):
+                block_num = latest_block - i
+                batch_payload.append({
+                    "jsonrpc": "2.0",
+                    "method": "eth_getBlockByNumber",
+                    "params": [hex(block_num), False],
+                    "id": block_num
+                })
+                
+            batch_resp = session.post(url, json=batch_payload, headers=headers, timeout=3)
+            if batch_resp.status_code != 200:
+                continue
+                
+            results = batch_resp.json()
+            
+            blocks = []
+            # Map by ID
+            result_map = {r['id']: r['result'] for r in results if isinstance(r, dict) and 'result' in r and r['result']}
+            
+            for i in range(limit):
+                b_num = latest_block - i
+                b_data = result_map.get(b_num)
+                if b_data:
+                    gas_used = int(b_data['gasUsed'], 16)
+                    gas_limit = int(b_data['gasLimit'], 16)
+                    fullness = (gas_used / gas_limit) * 100 if gas_limit > 0 else 0
+                    
+                    blocks.append({
+                        'number': b_num,
+                        'gasUsed': gas_used,
+                        'gasLimit': gas_limit,
+                        'fullness': fullness
+                    })
+            
+            if len(blocks) >= limit // 2:
+                _last_eth_blocks = blocks  # Save for fallback
+                return blocks
+                
+        except Exception:
+            continue
+    
+    # Return last successful result if available
+    if _last_eth_blocks:
+        return _last_eth_blocks
+            
+    # Fallback to Mock Data if all RPCs fail and no cache
+    import random
+    import time
+    
+    base_block = 21000000 + int(time.time() / 12) 
+    
+    mock_blocks = []
+    for i in range(limit):
+        mock_blocks.append({
+            'number': base_block - i,
+            'gasUsed': 0,
+            'gasLimit': 0,
+            'fullness': random.uniform(40, 80)
+        })
+        
+    return mock_blocks
+
+@st.cache_data(ttl=60, show_spinner=False)  # Extended from 10s to 60s
+def get_eth_price():
+    """
+    Fetches latest ETH price from Binance, falling back to CoinGecko.
+    Uses connection pooling and returns cached fallback on failure.
+    """
+    global _last_eth_price
+    
+    session = get_http_session()
+    
+    # 1. Try Binance
+    try:
+        url = "https://api.binance.com/api/v3/ticker/24hr?symbol=ETHUSDT"
+        response = session.get(url, timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            result = {
+                'price': float(data['lastPrice']),
+                'volume': float(data['quoteVolume']),
+                'change': float(data['priceChangePercent'])
+            }
+            _last_eth_price = result  # Save for fallback
+            return result
+    except:
+        pass
+
+    # 2. Fallback: CoinGecko
+    try:
+        url_cg = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_vol=true&include_24hr_change=true"
+        response = session.get(url_cg, timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            eth = data.get('ethereum', {})
+            result = {
+                'price': float(eth.get('usd', 0)),
+                'volume': float(eth.get('usd_24h_vol', 0)),
+                'change': float(eth.get('usd_24h_change', 0))
+            }
+            _last_eth_price = result
+            return result
+    except:
+        pass
+    
+    # Return last successful result if available
+    if _last_eth_price:
+        return _last_eth_price
+        
+    # Final fallback with default value
+    return {'price': 3200.0, 'volume': 0, 'change': 0}
 
