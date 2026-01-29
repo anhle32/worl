@@ -39,31 +39,31 @@ st.sidebar.title("Cấu hình")
 
 # 1. Country Selection
 st.sidebar.subheader("1. Chọn dữ liệu")
-# Load countries from cache
-all_countries_df = utils.get_country_list()
+
+# Load countries from cache with spinner
+with st.sidebar:
+    with st.spinner("Đang tải danh sách quốc gia..."):
+        all_countries_df = utils.get_country_list()
+
 if not all_countries_df.empty:
-    # Filter out aggregates if possible, usually 'region' column is 'Aggregates' or similar
-    # But for simplicity and to match prompt "Region", we'll just show name and code
-    country_options = all_countries_df[['name', 'iso2c']].set_index('iso2c')['name'].to_dict()
-    # Also support iso3c if available, wb typically returns iso2c in keys. 
-    # Let's map iso2c to name for display, value is iso2c (WB API often takes iso2 or iso3)
-    # The prompt mentions ABW, VNM (iso3). wb.download works with both.
-    # Let's use the 'id' column which usually stores the code passed to API.
-    
-    # We'll creates a dict {Code: Name}
-    # It seems wb.get_countries() returns 'iso3c', 'iso2c', 'name', etc.
+    # Create country map {iso3c: name}
     if 'iso3c' in all_countries_df.columns:
-         country_map = dict(zip(all_countries_df['iso3c'], all_countries_df['name']))
+        country_map = dict(zip(all_countries_df['iso3c'], all_countries_df['name']))
+    elif 'id' in all_countries_df.columns:
+        country_map = dict(zip(all_countries_df['id'], all_countries_df['name']))
     else:
-         country_map = dict(zip(all_countries_df['id'], all_countries_df['name']))
+        country_map = {}
 else:
     country_map = {}
+
+# Set default countries (only if they exist in the map)
+default_countries = [c for c in ['VNM', 'CHN', 'USA'] if c in country_map]
 
 selected_country_codes = st.sidebar.multiselect(
     "Chọn Quốc gia",
     options=list(country_map.keys()),
     format_func=lambda x: f"{x} - {country_map.get(x, '')}",
-    default=['VNM', 'CHN', 'USA']  # Defaults
+    default=default_countries
 )
 
 # 2. Indicator Selection
@@ -524,14 +524,20 @@ with tab5:
                 # Prepare data for plotting: Country, Value
                 plot_data = region_df[['COUNTRY', selected_year]].rename(columns={selected_year: 'GrowthRate'})
                 
-                # 5. Load Map
-                @st.cache_data
+                # 5. Load Map with better caching
+                @st.cache_data(ttl=86400)  # Cache for 24 hours
                 def load_map_data():
-                    url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
-                    return gpd.read_file(url)
+                    try:
+                        url = "https://naciscdn.org/naturalearth/110m/cultural/ne_110m_admin_0_countries.zip"
+                        return gpd.read_file(url)
+                    except Exception:
+                        # Try alternative URL
+                        alt_url = "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/master/geojson/ne_110m_admin_0_countries.geojson"
+                        return gpd.read_file(alt_url)
 
                 try:
-                    world = load_map_data()
+                    with st.spinner("Đang tải bản đồ..."):
+                        world = load_map_data()
                 except Exception as e:
                      st.error(f"Không thể tải dữ liệu bản đồ từ internet: {e}")
                      st.stop()
