@@ -15,8 +15,13 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="WorldBank Data Analytics Pro", layout="wide")
 
 # --- Helper Fragments ---
-@st.fragment(run_every=60)  # Reduced from 20s to 60s for stability with 200 concurrent users
+@st.fragment
 def render_eth_monitor():
+    # Manual Refresh Button
+    col_refresh, _ = st.columns([1, 5])
+    with col_refresh:
+        if st.button("🔄 Cập nhật"):
+            pass # Button click triggers fragment rerun automatically
     # Fetch Data
     eth_data = utils.get_latest_eth_blocks(8)
     eth_price_data = utils.get_eth_price()
