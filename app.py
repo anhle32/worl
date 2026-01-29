@@ -15,13 +15,13 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="WorldBank Data Analytics Pro", layout="wide")
 
 # --- Helper Fragments ---
-@st.fragment
+# @st.fragment (Removed to prevent potential hanging issues)
 def render_eth_monitor():
     # Manual Refresh Button
     col_refresh, _ = st.columns([1, 5])
     with col_refresh:
         if st.button("🔄 Cập nhật"):
-            pass # Button click triggers fragment rerun automatically
+            st.rerun()
     # Fetch Data
     eth_data = utils.get_latest_eth_blocks(8)
     eth_price_data = utils.get_eth_price()
