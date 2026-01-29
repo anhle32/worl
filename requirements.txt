@@ -1,0 +1,9 @@
+streamlit
+pandas
+pandas_datareader
+plotly
+statsmodels
+scikit-learn
+setuptools
+geopandas
+matplotlib
